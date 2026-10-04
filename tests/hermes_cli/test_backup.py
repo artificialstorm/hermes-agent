@@ -1450,6 +1450,12 @@ class TestSafeCopyDb:
         clock = iter((100.0, 100.5, 101.1))
 
         class FakeSourceConnection:
+            def execute(self, _sql):
+                return self
+
+            def fetchone(self):
+                return ("wal",)
+
             def backup(self, _destination, *, pages, progress, sleep):
                 assert pages > 0
                 assert sleep > 0
