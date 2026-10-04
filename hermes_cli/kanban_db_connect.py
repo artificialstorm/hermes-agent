@@ -821,8 +821,8 @@ _LATER_TASK_COLUMNS = (
     ("current_step_key", "current_step_key TEXT"),
     # JSON array of skill names the dispatcher force-loads via --skills.
     ("skills", "skills TEXT"),
-    # Per-task override for the consecutive-failure circuit breaker; NULL =
-    # ``kanban.failure_limit`` config, then ``DEFAULT_FAILURE_LIMIT``.
+    # Per-task failure-breaker and total automatic-claim ceiling; NULL keeps
+    # the configured failure limit and the separate finite default claim cap.
     ("max_retries", "max_retries INTEGER"),
     ("model_override", "model_override TEXT"),
     ("provider_override", "provider_override TEXT"),
@@ -935,6 +935,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 _add_column_if_missing(conn, "task_runs", name, ddl)
         _backfill_legacy_inflight_runs(conn)
 
+    # An ALTER with DEFAULT 0 would grant previously claimed phases a fresh
+    # budget. Add and reconstruct together so an interrupted migration cannot
+    # leave the new column present with uncharged historical claims.
+    if "automatic_attempts" not in _column_names(conn, "tasks"):
+        with write_txn(conn, allow_nested=conn.in_transaction):
+            if _add_column_if_missing(
+                conn, "tasks", "automatic_attempts",
+                "automatic_attempts INTEGER NOT NULL DEFAULT 0",
+            ):
+                _backfill_legacy_automatic_attempts(conn)
+
     # One-shot event-kind rename: old names still worked but were awkward on
     # the wire. Fires once per DB — after the UPDATE no rows match.
     for old, new in (
@@ -945,6 +956,62 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
 
     _rebuild_drifted_tables(conn)
+
+
+
+def _backfill_legacy_automatic_attempts(conn: sqlite3.Connection) -> None:
+    """Charge prior claims since the last explicit phase reset on upgrade.
+
+    Both claim events and run rows are native evidence. Older running rows may
+    have a synthesized run without a claim event; take the greater count, not
+    their sum. Timestamp ties on reset events are resolved conservatively by
+    run id, and an operator can explicitly unblock any over-counted phase.
+    Called only in the same transaction that adds the counter.
+    """
+    has_runs = _table_exists(conn, "task_runs")
+    rows = conn.execute(
+        "SELECT id, status FROM tasks WHERE status NOT IN ('done', 'archived')",
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        phase = conn.execute(
+            "SELECT rowid AS ordinal, run_id, created_at FROM task_events "
+            "WHERE task_id = ? AND kind IN "
+            "('unblocked', 'review_requested', 'changes_requested', 'review_reopened') "
+            "ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        event_id = int(phase["ordinal"]) if phase else 0
+        claimed = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+            "AND kind = 'claimed' AND rowid > ?",
+            (task_id, event_id),
+        ).fetchone()[0]
+        if not has_runs:
+            runs = 0
+        elif phase:
+            runs = conn.execute(
+                "SELECT COUNT(*) FROM task_runs AS r WHERE r.task_id = ? AND "
+                "(r.started_at > ? OR (r.started_at = ? AND r.rowid > "
+                "COALESCE((SELECT prev.rowid FROM task_runs AS prev "
+                "WHERE prev.task_id = ? AND prev.id = ?), 0) AND NOT EXISTS "
+                "(SELECT 1 FROM task_events AS e WHERE e.task_id = r.task_id "
+                "AND e.kind = 'claimed' AND e.run_id = r.id AND e.rowid <= ?)))",
+                (
+                    task_id, phase["created_at"], phase["created_at"],
+                    task_id, phase["run_id"], event_id,
+                ),
+            ).fetchone()[0]
+        else:
+            runs = conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,),
+            ).fetchone()[0]
+        attempts = max(int(claimed), int(runs), int(row["status"] == "running"))
+        if attempts:
+            conn.execute(
+                "UPDATE tasks SET automatic_attempts = ? WHERE id = ?",
+                (attempts, task_id),
+            )
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:

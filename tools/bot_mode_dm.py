@@ -645,7 +645,16 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
                       profile_home: Path | None = None, author: Optional[dict] = None) -> str:
     """Build an argv-safe command for the cleanup-owning background runner:
     ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] <argv...>``."""
-    runner_argv = [sys.executable, str(Path(__file__).resolve()), "--run-delivery",
+    runner_python = sys.executable
+    if profile_home is not None and not stdin_file and argv:
+        # The tool host may use a minimal Python without the Hermes CLI's dependencies.
+        # Live-owner admission imports those dependencies before falling back to a CLI turn.
+        cli = Path(argv[0])
+        if cli.is_absolute() and cli.name in ("hermes", "hermes.exe"):
+            candidate = cli.with_name("python.exe" if sys.platform == "win32" else "python3")
+            if candidate.is_file():
+                runner_python = str(candidate)
+    runner_argv = [runner_python, str(Path(__file__).resolve()), "--run-delivery",
                    "stdin" if stdin_file else "query-file", dm_file]
     if profile_home is not None:
         runner_argv.extend(["--profile-home", str(Path(profile_home).resolve())])

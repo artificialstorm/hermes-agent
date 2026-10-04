@@ -101,10 +101,23 @@ class TestHandleUpdateCommand:
 
         fake_spec = MagicMock()
         with patch("shutil.which", return_value="/tmp/attacker/hermes"), \
-             patch("importlib.util.find_spec", return_value=fake_spec):
+             patch("importlib.util.find_spec", return_value=fake_spec), \
+             patch("gateway.run.__file__", "/uninstalled-source/gateway/run.py"):
             result = _resolve_hermes_bin()
 
         assert result == [sys.executable, "-m", "hermes_cli.main"]
+
+    def test_resolve_hermes_bin_uses_own_source_launcher(self, tmp_path):
+        """A source gateway's fresh child must not rely on the parent's sys.path."""
+        from gateway.run import _resolve_hermes_bin
+
+        root = tmp_path / "source-install"
+        launcher = root / ".hermes" / "bin" / "hermes"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        with patch("gateway.run.__file__", str(root / "gateway" / "run.py")):
+            assert _resolve_hermes_bin() == [str(launcher)]
 
     @pytest.mark.asyncio
     async def test_resolve_hermes_bin_falls_back_to_path_then_none(self):
@@ -113,11 +126,13 @@ class TestHandleUpdateCommand:
         from gateway.run import _resolve_hermes_bin
 
         with patch("shutil.which", return_value="/usr/local/bin/hermes"), \
-             patch("importlib.util.find_spec", return_value=None):
+             patch("importlib.util.find_spec", return_value=None), \
+             patch("gateway.run.__file__", "/uninstalled-source/gateway/run.py"):
             assert _resolve_hermes_bin() == ["/usr/local/bin/hermes"]
 
         with patch("shutil.which", return_value=None), \
-             patch("importlib.util.find_spec", side_effect=ImportError):
+             patch("importlib.util.find_spec", side_effect=ImportError), \
+             patch("gateway.run.__file__", "/uninstalled-source/gateway/run.py"):
             assert _resolve_hermes_bin() is None
 
 
@@ -138,7 +153,7 @@ class TestHandleUpdateCommand:
         hermes_home.mkdir()
 
         with patch("gateway.run._hermes_home", hermes_home), \
-             patch("gateway.run.__file__", fake_file), \
+             patch("gateway.slash_commands.__file__", fake_file), \
              patch("hermes_cli.config.detect_install_method", return_value="git"), \
              patch("shutil.which", side_effect=lambda x: "/usr/bin/hermes" if x == "hermes" else "/usr/bin/setsid"), \
              patch("subprocess.Popen"):
@@ -181,7 +196,7 @@ class TestHandleUpdateCommand:
             return None
 
         with patch("gateway.run._hermes_home", hermes_home), \
-             patch("gateway.run.__file__", fake_file), \
+             patch("gateway.slash_commands.__file__", fake_file), \
              patch("hermes_cli.config.detect_install_method", return_value="git"), \
              patch("shutil.which", side_effect=which_no_setsid), \
              patch("subprocess.Popen", mock_popen):

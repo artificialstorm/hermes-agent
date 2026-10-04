@@ -26,6 +26,8 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.context_compressor import (
     _MAX_PRUNED_SKILL_MARKERS,
     _skill_pruned_marker,
@@ -37,6 +39,18 @@ from agent.conversation_compression import (
 )
 from hermes_state import SessionDB
 from tools.todo_tool import TODO_INJECTION_HEADER
+
+
+@pytest.fixture(autouse=True)
+def _isolate_launcher_bootstrap(monkeypatch):
+    """Exercise compression, not install recovery, in the isolated test home.
+
+    Late imports of run_agent must not activate this checkout's real payload.
+    Keep the home-I/O guard active and replace only launcher side effects.
+    """
+    monkeypatch.setattr("hermes_cli.venv_sync.prepare_launch", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli._early_recovery.recover_if_needed", lambda *args, **kwargs: None)
+    monkeypatch.setattr("pm.environments.activate_dependencies", lambda *args, **kwargs: None)
 
 
 def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "cli"):
@@ -125,6 +139,85 @@ class TestPrunedSkillReloadNotice:
         notice = _pruned_skill_reload_notice(rows)
         assert notice.count("skill_view(name='alpha')") == 1
         assert notice.index("alpha") < notice.index("beta")
+
+    def test_retained_reload_clears_historical_notice_until_pruned_again(self):
+        import json
+
+        marker = _skill_pruned_marker("weave-mission")
+        rows = [{"role": "assistant", "content": marker}]
+        call = {
+            "role": "assistant", "content": "", "tool_calls": [{
+                "id": "reload", "type": "function", "function": {
+                    "name": "skill_view", "arguments": json.dumps({"name": "weave-mission"}),
+                },
+            }],
+        }
+        result = {"role": "tool", "tool_call_id": "reload", "content": json.dumps({
+            "success": True, "name": "weave-mission", "content": "# Instructions\n" + "x" * 6000,
+        })}
+        assert "weave-mission" in _pruned_skill_reload_notice(rows)
+        # A failed reload cannot satisfy the safety requirement.
+        failed = dict(result, content=json.dumps({"success": False, "error": "blocked"}))
+        assert "weave-mission" in _pruned_skill_reload_notice(rows + [call, failed])
+        # Neither can a reference-file load masquerade as the full skill.
+        reference_call = json.loads(json.dumps(call))
+        reference_call["tool_calls"][0]["function"]["arguments"] = json.dumps({
+            "name": "weave-mission", "file_path": "references/brief.md",
+        })
+        assert "weave-mission" in _pruned_skill_reload_notice(rows + [reference_call, result])
+        retained = rows + [call, result]
+        assert _pruned_skill_reload_notice(retained) == ""
+        # If the fresh body itself is lost at a later boundary, reload is needed again.
+        assert "weave-mission" in _pruned_skill_reload_notice(rows + [call, dict(result, content=marker)])
+
+    @pytest.mark.parametrize("kind", [
+        "later-marker", "older-body", "duplicate-markers", "placeholder", "unknown-name",
+    ])
+    def test_only_newer_usable_body_supersedes_named_marker(self, kind):
+        import json
+
+        name = {"placeholder": "...", "unknown-name": "?"}.get(kind, "required-skill")
+        marker = {"role": "user", "content": _skill_pruned_marker(name)}
+        call = {"role": "assistant", "tool_calls": [{"id": "load", "function": {
+            "name": "skill_view", "arguments": json.dumps({"name": name}),
+        }}]}
+        body = {"role": "tool", "tool_call_id": "load", "content": json.dumps({
+            "success": True, "name": name, "content": "# Required safety\nGet approval before sending.",
+        })}
+        rows = {
+            "later-marker": [marker, call, body, marker],
+            "older-body": [call, body, marker],
+            "duplicate-markers": [marker, marker, call, body],
+            "placeholder": [marker],
+            "unknown-name": [marker],
+        }[kind]
+        notice = _pruned_skill_reload_notice(rows)
+        if kind in {"later-marker", "older-body"}:
+            assert notice.count("skill_view(name='required-skill')") == 1
+        else:
+            assert notice == ""
+
+    @pytest.mark.parametrize("result", [
+        {"success": False, "content": "Error: unavailable"},
+        {"success": True},
+        {"success": True, "content": "  \n"},
+        {"success": True, "content": "[skill_view] name=required-skill (6000 chars)"},
+        {"success": True, "content": "[SKILL_PRUNED]"},
+        {"success": True, "content": _skill_pruned_marker("required-skill")},
+        {"success": True, "content": ["not a skill body"]},
+        {"success": "true", "content": "# Instructions"},
+    ])
+    def test_nonusable_results_cannot_clear_reload_requirement(self, result):
+        import json
+
+        rows = [
+            {"role": "user", "content": _skill_pruned_marker("required-skill")},
+            {"role": "assistant", "tool_calls": [{"id": "load", "function": {
+                "name": "skill_view", "arguments": '{"name": "required-skill"}',
+            }}]},
+            {"role": "tool", "tool_call_id": "load", "content": json.dumps(result)},
+        ]
+        assert "skill_view(name='required-skill')" in _pruned_skill_reload_notice(rows)
 
     def test_empty_when_nothing_pruned(self):
         rows = [

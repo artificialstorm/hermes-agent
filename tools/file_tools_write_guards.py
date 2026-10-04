@@ -3,7 +3,8 @@
 Every guard returns ``None`` when the write may proceed, else an error string
 the tool returns verbatim.
 Guards, in the order the tools apply them: ``_check_sensitive_path`` (hard
-deny), ``_check_binary_document_write``, ``_check_protected_instruction_write``
+deny), ``_check_managed_skill_entry_write`` (use skill_manage),
+``_check_binary_document_write``, ``_check_protected_instruction_write``
 (ALWAYS ask), ``_check_approval_required_write`` (normal gate),
 ``_check_cross_profile_path`` (sandbox-mirror lost-work), ``_is_internal_file_tool_content``.
 ``_stale_overwrite_blocker`` (write_file only, under the per-path lock) refuses a
@@ -23,7 +24,7 @@ from tools.binary_extensions import (
     is_sqlite_sidecar,
 )
 from tools.file_tools_paths import (
-    _expand_tilde, _resolve_path_for_task, _ssh_path_escapes_home, _terminal_env_type_for_task)
+    _expand_tilde, _resolve_entry_for_task, _resolve_path_for_task, _ssh_path_escapes_home, _terminal_env_type_for_task)
 from tools.file_tools_read_tracking import _has_full_write_baseline, _read_mtime_drifted
 
 # Prefixes matched after realpath. macOS: /private/var mirrors /var — block the
@@ -170,6 +171,75 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.")
+    return None
+
+
+def _managed_entry_relative_to(entry: Path, root: Path) -> Path | None:
+    """Match existing identities; fail closed on case-ambiguous missing suffixes.
+
+    samefile preserves distinct existing case-sensitive directories. Missing
+    components have no identity to compare: do not assume their filesystem is
+    case-sensitive, infer it from the OS, or create probes in managed roots.
+    Case-only alternate spellings there must go through skill_manage, even on
+    a case-sensitive volume; this is a conservative refusal, not an alias key.
+    """
+    anchor = root
+    missing = []
+    while not anchor.exists() and anchor != anchor.parent:
+        missing.append(anchor.name)
+        anchor = anchor.parent
+    suffix = tuple(reversed(missing))
+    for parent in (entry, *entry.parents):
+        try:
+            matches = parent.samefile(anchor)
+        except FileNotFoundError:
+            continue
+        if matches:
+            relative = entry.relative_to(parent)
+            prefix = relative.parts[:len(suffix)]
+            if prefix == suffix:
+                return Path(*relative.parts[len(suffix):])
+            if (len(prefix) == len(suffix)
+                    and all(a.casefold() == b.casefold() for a, b in zip(prefix, suffix))):
+                raise ValueError(
+                    "ambiguous case spelling of a missing managed-skill root; use skill_manage")
+            return None
+    return None
+
+
+def _check_managed_skill_entry_write(filepath: str, task_id: str = "default") -> str | None:
+    """Route host-managed SKILL.md mutations through skill_manage's cap/approval gates.
+
+    This is a native file-tool boundary, not an OS sandbox. Remote backends do
+    not share the controller's filesystem or managed roots. Resolve profile and
+    configured roots per call; unrelated project SKILL.md/support files are not
+    managed entries. Check the entry spelling AND referent for symlink aliases.
+    """
+    from tools.file_tools import _file_ops_uses_host_paths, _get_file_ops
+    try:
+        if not _file_ops_uses_host_paths(_get_file_ops(task_id)):
+            return None
+        from agent.skill_utils import get_all_skills_dirs, get_skill_create_dir, is_excluded_skill_path
+        targets = (Path(_resolve_entry_for_task(filepath, task_id)),
+                   Path(_resolve_path_for_task(filepath, task_id)))
+        entries = [p for p in targets if p.name.lower() == "skill.md"]
+        if not entries:
+            return None
+        roots = get_all_skills_dirs()
+        create_dir = get_skill_create_dir()  # Also covers a not-yet-created directory.
+        if create_dir is not None:
+            roots = [*roots, create_dir]
+        for root in roots:
+            root = Path(root).resolve()
+            for entry in entries:
+                relative = _managed_entry_relative_to(entry, root)
+                if relative is not None and not is_excluded_skill_path(root / relative, root=root):
+                    return (
+                        f"Refusing to modify managed skill entry: {filepath}. "
+                        "Use skill_manage so skills.max_entry_chars and skills.write_approval "
+                        "are enforced before writes. The file was NOT modified.")
+    except (OSError, ValueError, RuntimeError) as exc:
+        return f"Cannot establish the managed-skill write boundary for {filepath}: {exc}. File NOT modified."
     return None
 
 

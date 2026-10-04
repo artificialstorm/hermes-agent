@@ -20,6 +20,8 @@ Test patterns for the marker emit checks adapted from PR #32375
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.context_compressor import (
     SKILL_PRUNED_MARKER_PREFIX,
     SUMMARY_PREFIX,
@@ -29,6 +31,19 @@ from agent.context_compressor import (
     _skill_pruned_marker,
     _summarize_tool_result,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_launcher_bootstrap(monkeypatch):
+    """Keep late conversation-loop imports inside this compression test scope.
+
+    The real-home guard remains active; installation recovery and dependency
+    activation are launcher concerns, not behavior exercised by these tests.
+    """
+    monkeypatch.setattr("hermes_cli.venv_sync.prepare_launch", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli._early_recovery.recover_if_needed", lambda *args, **kwargs: None)
+    monkeypatch.setattr("pm.environments.activate_dependencies", lambda *args, **kwargs: None)
+
 
 def _make_compressor(**overrides):
     kwargs = dict(
@@ -124,15 +139,18 @@ class TestProtectedSkillPrune:
             out.append({"role": role, "content": f"filler {start + i} " + "y" * 400})
         return out
 
-    def test_recently_loaded_skill_survives_prune(self):
+    @pytest.mark.parametrize("tail_required", [False, True])
+    def test_recently_loaded_skill_survives_prune(self, tail_required):
         c = _make_compressor()
-        # skill loaded within the last 10 messages, but OUTSIDE the
-        # protected tail count — without the guard it would be demoted.
+        # Recent loads and older skills explicitly required by the tail must
+        # both remain usable outside the protected tail count.
         msgs = (
             self._filler(10)
             + _skill_view_pair("call_s", "fresh-skill")
-            + self._filler(6, start=10)
+            + self._filler(16 if tail_required else 6, start=10)
         )
+        if tail_required:
+            msgs.append({"role": "user", "content": "You must use fresh-skill for this task."})
         result, _ = c._prune_old_tool_results(msgs, protect_tail_count=4)
         skill_row = result[11]
         assert skill_row["content"].startswith("# fresh-skill instructions")

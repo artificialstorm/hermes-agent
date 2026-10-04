@@ -799,7 +799,8 @@ class Task:
     model_override: Optional[str] = None
     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
-    # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
+    # Failure-breaker trip count and per-phase total automatic-claim ceiling;
+    # None -> dispatcher failure limit, but a finite default claim ceiling.
     max_retries: Optional[int] = None
     # ``/goal``-style loop: a judge re-checks each turn IN THE SAME SESSION until
     # done / budget exhausted (-> kanban_block); ``goal_max_turns`` None -> goals default.
@@ -972,6 +973,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- The circuit breaker in _record_task_failure trips when this
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    -- Every automatic claim, including quota exits, since the last successful
+    -- handoff or explicit operator unblock; independent of the failure breaker.
+    automatic_attempts INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
     -- Restart-stable fingerprint of worker_pid ("<boot/instantiation epoch>|<start time>",
     -- kanban_db_dispatch._process_fingerprint) recorded at spawn: liveness and kills require pid
@@ -1009,7 +1013,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
-    -- Per-task override for the consecutive-failure circuit breaker.
+    -- Per-task override for the consecutive-failure circuit breaker and
+    -- total automatic-claim ceiling in each phase (including quota exits).
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
     -- case) falls through to the dispatcher-level ``kanban.failure_limit``
@@ -2297,13 +2302,16 @@ def _claim_and_open_run(
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    if _block_exhausted_automatic_attempts(conn, task_id, source_status):
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
+               started_at    = COALESCE(started_at, ?),
+               automatic_attempts = automatic_attempts + 1
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
@@ -2336,6 +2344,59 @@ def _claim_and_open_run(
         {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
     )
     return run_id
+
+# This must be finite even without a per-card override. A card with
+# max_retries=1 permits exactly one automatic claim per phase.
+DEFAULT_AUTOMATIC_ATTEMPT_LIMIT = 5
+
+
+def _automatic_attempt_budget(
+    conn: sqlite3.Connection, task_id: str, source_status: str,
+) -> Optional[tuple[int, int, str]]:
+    """Read the claim count, effective ceiling and limit source for a lane."""
+    row = conn.execute(
+        "SELECT status, automatic_attempts, max_retries FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != source_status:
+        return None
+    override = row["max_retries"]
+    limit = max(1, int(override)) if override is not None else DEFAULT_AUTOMATIC_ATTEMPT_LIMIT
+    return int(row["automatic_attempts"] or 0), limit, "task" if override is not None else "default"
+
+
+def _block_exhausted_automatic_attempts(
+    conn: sqlite3.Connection, task_id: str, source_status: str, *,
+    trigger_outcome: str = "claim_refused", run_id: Optional[int] = None,
+) -> bool:
+    """Park an exhausted phase without rewriting its last run's outcome.
+
+    The caller holds the write transaction. Explicit ``unblock_task`` resets
+    the separate budget and resumes in the same lane.
+    """
+    budget = _automatic_attempt_budget(conn, task_id, source_status)
+    if budget is None:
+        return False
+    attempts, limit, limit_source = budget
+    if attempts < limit:
+        return False
+    reason = f"automatic attempt ceiling exhausted ({attempts}/{limit}); unblock to resume"
+    changed = conn.execute(
+        "UPDATE tasks SET status = 'blocked', "
+        "last_failure_error = COALESCE(last_failure_error, ?) "
+        "WHERE id = ? AND status = ?",
+        (reason, task_id, source_status),
+    )
+    if changed.rowcount != 1:
+        return False
+    _append_event(
+        conn, task_id, "gave_up",
+        {"sticky": True, "reason": "automatic_attempt_ceiling", "attempts": attempts,
+         "effective_limit": limit, "limit_source": limit_source,
+         "retry_status": source_status, "trigger_outcome": trigger_outcome},
+        run_id=run_id,
+    )
+    return True
 
 
 def claim_task(
@@ -2859,6 +2920,7 @@ def complete_task(
                    SET status       = 'done',
                        result       = ?,
                        completed_at = ?,
+                       automatic_attempts = 0,
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,
@@ -3514,6 +3576,7 @@ def request_review(
                 """
                 UPDATE tasks
                    SET status        = 'review',
+                       automatic_attempts = 0,
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL
@@ -3614,6 +3677,7 @@ def request_changes(
             """
             UPDATE tasks
                SET status = ?,
+                   automatic_attempts = 0,
                    assignee = COALESCE(?, assignee),
                    claim_lock = NULL,
                    claim_expires = NULL,
@@ -3749,7 +3813,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # is a fresh start for the retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, automatic_attempts = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -3785,7 +3849,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             # consecutive_failures deliberately PRESERVED: review reopen is not
             # a success signal; only complete_task resets the breaker (#35072).
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+            "automatic_attempts = 0 "
             + (", assignee = ?" if implementer else "")
             + " WHERE id = ? AND status = 'review'",
             params,

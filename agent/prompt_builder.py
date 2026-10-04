@@ -1419,8 +1419,6 @@ def _render_skills_index(
         hidden_note += (f"\n(A copy of {', '.join(unloadable)} is not listed: it shares both its name and its path "
                         "with a different skill in the same skills directory tier (e.g. another external_dirs entry), "
                         "so skill_view cannot load it — rename one.)")
-    # Don't name web_search when the session has no web tools (dangling reference).
-    _basic_tools = "terminal" if available_tools is not None and "web_search" not in available_tools else "web_search or terminal"
     index_lines = []
     for category in sorted(skills_by_category):
         entries = skills_by_category[category]
@@ -1443,15 +1441,14 @@ def _render_skills_index(
         )
     return (
         "## Skills\n"
-        "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
-        "task, you MUST load it with skill_view(name) and follow its instructions. Err on the side of "
-        "loading — it is always better to have context you don't need than to miss critical steps, pitfalls, "
-        "or established workflows. Skills contain specialized knowledge — API endpoints, tool-specific "
-        "commands, and proven workflows that outperform general-purpose approaches. Load the skill "
-        f"even if you think you could handle the task with basic tools like {_basic_tools}. "
-        "Skills also encode the user's preferred approach, conventions, and quality standards for tasks like "
-        "code review, planning, and testing — load them even for tasks you already know how to do, because "
-        "the skill defines how it should be done here.\n"
+        "Scan the skills below. You MUST load skills explicitly required by applicable instructions, "
+        "and skills directly needed for the present task, with skill_view(name) and follow their instructions. "
+        "Partial topical overlap alone is not a reason to load a skill. Ordinary project work does not "
+        "require Hermes operational skills merely because it runs through Hermes.\n"
+        "Coordinators load routing context; workers load the specialty skills needed for their assigned work. "
+        "Do not preload workers' specialty skills merely to delegate. Choose task-specific references "
+        "rather than bulk-loading linked references or related skills. This selection rule does not waive "
+        "explicit required-skill, safety, or approval obligations.\n"
         "If a skill has issues, fix it with skill_manage(action='patch').\n"
         "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
         "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
@@ -1459,7 +1456,7 @@ def _render_skills_index(
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
-        "Only proceed without loading a skill if genuinely none are relevant to the task."
+        "Proceed without loading a skill when none is explicitly required or directly needed."
         + hidden_note
     )
 

@@ -820,6 +820,35 @@ skills:
 
 Resolved once per session when the system prompt is first built (so the prompt stays cache-stable; edits apply to the next session). Missing or disabled skills warn and are skipped; `--ignore-rules` / `HERMES_IGNORE_RULES=1` suppresses the list. Profile-scoped. See [CLI — persistent auto-load](./cli.md#persistent-auto-load-via-config).
 
+### Skill entry size limit
+
+`skills.max_entry_chars` caps the **entire SKILL.md** (frontmatter and body) written by
+`skill_manage`. It is profile-scoped and resolved for each call. The default is 100,000
+characters, preserving the existing hard ceiling; choose a smaller budget explicitly:
+
+```bash
+hermes config set skills.max_entry_chars 15000
+```
+
+Use an integer from 1 through 100,000. Invalid explicit values (including strings,
+booleans and null) or unreadable configuration refuse entry writes rather than falling
+back to a larger limit. Nothing is silently truncated. Existing entries above your
+configured limit may strictly shrink, but may not stay the same size or grow; the
+100,000-character hard ceiling still applies. Atomic batches compare each final entry
+with its pre-batch version, not intermediate patch sizes, and reject size violations
+before writing any skill files. Both atomic and legacy flat requests check size before
+approval staging, and replay checks the current cap again. Approval gates still apply.
+
+Split unrelated procedures into separate narrow skills. Keep task-specific depth in
+supporting references loaded only on demand, not a mandatory read-all chain. Supporting
+files retain their existing 100,000-character and 1 MiB limits, independent of the entry
+budget. Deletes (including removing SKILL.md) and hand-placed or hub-installed skill
+reads are unchanged. Native host `write_file` and `patch` tools refuse managed entry
+mutations and direct them through `skill_manage`, including entries in the active
+profile's configured creation/external directories. Unrelated project files and remote
+backend namespaces retain their own guards. This is not an OS sandbox: arbitrary shell
+or other direct filesystem writes are not policed by this setting.
+
 ### Guard on agent-created skill writes
 
 When the agent uses `skill_manage` to create, edit, patch, or delete a skill, Hermes can optionally scan the new/updated content for dangerous keyword patterns (credential harvesting, obvious prompt injection, exfil instructions). The scanner is **off by default** — real agent workflows that legitimately touch `~/.ssh/` or mention `$OPENAI_API_KEY` were tripping the heuristic too often. Turn it back on if you want the scanner to prompt you before the agent's skill writes land:

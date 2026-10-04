@@ -254,6 +254,53 @@ class TestParseSkillFile:
 # =========================================================================
 
 
+class TestSkillLoadingGuidance:
+    """Rendered instruction contracts, not claims about model compliance."""
+
+    @pytest.fixture
+    def rendered(self, monkeypatch):
+        from agent.prompt_builder import _render_skills_index
+
+        monkeypatch.setattr("agent.oneshot_footprint.is_single_query_session", lambda: False)
+        return _render_skills_index(
+            {"project": [("project-testing", "Project test conventions")],
+             "runtime": [("hermes-agent", "Configure Hermes itself")],
+             "routing": [("coordinator", "Route delegated work")]},
+            {}, None, {"skill_view", "skill_manage", "terminal"},
+        )
+
+    def test_ordinary_project_work_loads_only_required_or_directly_needed(self, rendered):
+        assert "MUST load skills explicitly required by applicable instructions" in rendered
+        assert "directly needed for the present task" in rendered
+        assert "Ordinary project work does not require Hermes operational skills" in rendered
+        assert "Proceed without loading a skill when none is explicitly required or directly needed" in rendered
+        assert "even partially relevant" not in rendered
+        assert "Err on the side of loading" not in rendered
+        assert "context you don't need" not in rendered
+
+    def test_hermes_work_keeps_required_entrypoint(self, rendered):
+        from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE
+
+        assert "skill_view(name='hermes-agent')" in HERMES_AGENT_HELP_GUIDANCE
+        assert "before configuring, modifying, or troubleshooting Hermes" in HERMES_AGENT_HELP_GUIDANCE
+        assert "does not waive explicit required-skill, safety, or approval obligations" in rendered
+        assert "Only proceed without loading a skill if genuinely none are relevant" not in rendered
+
+    def test_coordinator_and_worker_load_their_own_scope(self, rendered):
+        assert "Coordinators load routing context" in rendered
+        assert "workers load the specialty skills needed for their assigned work" in rendered
+        assert "Do not preload workers' specialty skills merely to delegate" in rendered
+        assert "Choose task-specific references" in rendered
+        assert "rather than bulk-loading linked references or related skills" in rendered
+
+    def test_needed_pruned_skill_recovery_is_preserved(self):
+        from agent.prompt_builder import SKILLS_GUIDANCE
+
+        assert "[SKILL_PRUNED]" in SKILLS_GUIDANCE
+        assert "reload it with skill_view(name='...') before acting on anything that depends on it" in SKILLS_GUIDANCE
+        assert "After reloading, ignore any remaining" in SKILLS_GUIDANCE
+
+
 class TestBuildSkillsSystemPrompt:
     @pytest.fixture(autouse=True)
     def _clear_skills_cache(self):

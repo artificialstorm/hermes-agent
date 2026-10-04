@@ -160,6 +160,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "automatic_attempts" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
@@ -306,11 +307,8 @@ def test_stale_claim_extend_live_worker_does_not_count_failure(
 
 
 # ---------------------------------------------------------------------------
-# Rate-limit requeue: a worker that bails on a provider quota wall must be
-# released back to ``ready`` WITHOUT counting a failure, so a long (e.g.
-# 5-hour) quota window can't trip the circuit breaker and permanently block
-# the card. The respawn guard then defers it on a cooldown until quota
-# returns. Regression coverage for the kanban-rate-limit-failure report.
+# Rate-limit exits retain a distinct outcome and do not count as failures,
+# but the separate automatic-attempt ceiling must include them.
 # ---------------------------------------------------------------------------
 
 
@@ -324,9 +322,7 @@ def _exited_status(code: int) -> int:
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):
-    """A rate-limit sentinel exit releases the task to ``ready`` and leaves
-    ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    """Quota is not a task failure, yet it cannot requeue forever."""
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
 
@@ -337,9 +333,9 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="rl", assignee="a")
 
-        # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
-        # If any of these counted as a failure the task would be blocked.
-        for i in range(6):
+        # More quota outcomes than the failure breaker permits; the fifth
+        # automatic claim reaches the separate default attempt ceiling.
+        for i in range(5):
             pid = 70000 + i
             # Claim to open a real run (so detect_crashed_workers can close
             # it with a rate_limited outcome), then point the claim at this
@@ -362,9 +358,8 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             assert tid in rl
 
             task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"hit {i}: should requeue ready, got {task.status}"
-            )
+            assert task is not None
+            assert task.status == ("blocked" if i == 4 else "ready")
             assert task.consecutive_failures == 0, (
                 f"hit {i}: rate-limit must not count a failure, "
                 f"got {task.consecutive_failures}"
@@ -382,6 +377,134 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         ]
         assert "rate_limited" in outcomes
         assert "crashed" not in outcomes
+        assert outcomes.count("rate_limited") == 5
+        assert kb.claim_task(conn, tid) is None
+        blocked = kb.get_task(conn, tid)
+        assert blocked is not None and blocked.status == "blocked"
+        assert kb.unblock_task(conn, tid)
+        resumed = kb.get_task(conn, tid)
+        assert resumed is not None and resumed.status == "ready"
+        assert kb.claim_task(conn, tid) is not None
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_dispatch_quota_exit_obeys_one_attempt_budget_without_provider(
+    kanban_home, monkeypatch, all_assignees_spawnable, lane,
+):
+    """The real dispatcher can make no second spawn after one quota exit.
+
+    A worker stub returns a dead PID; no provider call, watchdog, or clock
+    polling stands in for the native claim/reap/dispatch boundaries.
+    """
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    spawns = []
+
+    def no_provider_spawn(task, workspace, board=None):
+        pid = 85000 + len(spawns)
+        spawns.append(pid)
+        return pid
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quota ceiling", assignee="a", max_retries=1)
+        if lane == "review":
+            assert kb.request_review(conn, tid, reviewer="a", summary="review the candidate")
+        first = kbd.dispatch_once(conn, spawn_fn=no_provider_spawn, max_in_progress=8)
+        assert len(first.spawned) == 1
+        _kbd._record_worker_exit(spawns[-1], _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+
+        second = kbd.dispatch_once(conn, spawn_fn=no_provider_spawn, max_in_progress=8)
+        assert len(spawns) == 1
+        assert not second.spawned
+        assert tid in second.auto_blocked
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+        runs = kb.list_runs(conn, tid)
+        quota_runs = [run for run in runs if run.outcome == "rate_limited"]
+        assert len(quota_runs) == 1
+        assert any(e.kind == "gave_up" for e in kb.list_events(conn, tid))
+        assert kb._has_sticky_block(conn, tid)
+        assert kbd.dispatch_once(conn, spawn_fn=no_provider_spawn).spawned == []
+        assert len(spawns) == 1
+
+        # Promotion deliberately changes the lane to ready. It must not
+        # bypass the budget, but exercise it only on the ready-lane card.
+        if lane == "ready":
+            promoted, _ = kb.promote_task(conn, tid, actor="operator")
+            assert promoted
+            assert kb.claim_task(conn, tid) is None
+            assert len(kb.list_runs(conn, tid)) == len(runs)
+            again = kb.get_task(conn, tid)
+            assert again is not None and again.status == "blocked"
+
+        gave_ups_before_unblock = len([e for e in kb.list_events(conn, tid) if e.kind == "gave_up"])
+        assert kb.unblock_task(conn, tid)
+        resumed_task = kb.get_task(conn, tid)
+        assert resumed_task is not None and resumed_task.status == lane
+        resumed = kbd.dispatch_once(conn, spawn_fn=no_provider_spawn, max_in_progress=8)
+        assert len(resumed.spawned) == 1
+        assert len(spawns) == 2
+        assert len(kb.list_runs(conn, tid)) == len(runs) + 1
+        _kbd._record_worker_exit(spawns[-1], _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+        exhausted_again = kbd.dispatch_once(conn, spawn_fn=no_provider_spawn, max_in_progress=8)
+        assert exhausted_again.spawned == []
+        assert exhausted_again.auto_blocked == [tid]
+        exhausted_task = kb.get_task(conn, tid)
+        assert exhausted_task is not None and exhausted_task.status == "blocked"
+        assert len([run for run in kb.list_runs(conn, tid) if run.outcome == "rate_limited"]) == 2
+        assert len([e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]) == gave_ups_before_unblock + 1
+        assert kbd.dispatch_once(conn, spawn_fn=no_provider_spawn, max_in_progress=8).spawned == []
+        assert len(spawns) == 2
+
+
+def test_quota_and_crash_share_claim_ceiling(kanban_home, monkeypatch):
+    """Alternating quota and crashes cannot reset the total-claim ceiling."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="mixed outcomes", assignee="a", max_retries=3)
+        host = _kb._claimer_id().split(":", 1)[0]
+        for i, code in enumerate((_kb.KANBAN_RATE_LIMIT_EXIT_CODE, 1, _kb.KANBAN_RATE_LIMIT_EXIT_CODE)):
+            pid = 86000 + i
+            assert kb.claim_task(conn, tid, claimer=f"{host}:w{i}") is not None
+            conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, tid))
+            conn.commit()
+            _kbd._record_worker_exit(pid, _exited_status(code))
+            kbd.detect_crashed_workers(conn)
+            task = kb.get_task(conn, tid)
+            assert task is not None and task.status == ("blocked" if i == 2 else "ready")
+        assert kb.claim_task(conn, tid) is None
+        assert conn.execute(
+            "SELECT automatic_attempts FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()[0] == 3
+        assert [r.outcome for r in kb.list_runs(conn, tid)] == [
+            "rate_limited", "crashed", "rate_limited",
+        ]
+
+
+def test_review_handoff_starts_fresh_claim_phase(kanban_home):
+    """A successful implementation handoff is not charged to its reviewer."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="two phases", assignee="implementer", max_retries=1)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.request_review(
+            conn, tid, reviewer="reviewer", summary="ready for review",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.claim_review_task(conn, tid) is not None
+        assert conn.execute(
+            "SELECT automatic_attempts FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
@@ -1569,16 +1692,15 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
 # launchd jobs, and other detached processes routinely run with a stripped
 # $PATH that doesn't include the venv's bin/, so a bare `["hermes", ...]`
 # spawn fails with FileNotFoundError and the task gets stuck. The resolver
-# prefers the interpreter-bound module form (exactly this install; a PATH
-# shim could be attacker-planted or belong to another install, #111569) and
-# only falls back to the PATH shim when ``hermes_cli`` is not importable.
+# prefers this source install's published launcher, then the importable
+# module when no launcher exists; a PATH shim may belong to another install.
+# A fresh child does not inherit the parent's injected sys.path (#111569).
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
-    """A `hermes` on PATH must not shadow the running install (#111569):
-    the module argv wins whenever ``hermes_cli`` is importable; only an
-    explicit ``$HERMES_BIN`` overrides it."""
+def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch, tmp_path):
+    """With no source launcher, an importable module beats a planted PATH shim;
+    only an explicit ``$HERMES_BIN`` overrides it."""
     import shutil
     import sys
     from hermes_cli import kanban_db_dispatch as kbd
@@ -1586,15 +1708,34 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
+    monkeypatch.setattr(kbd, "__file__", str(tmp_path / "hermes_cli" / "kanban_db_dispatch.py"))
     assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
 
 
+@pytest.mark.platforms("posix")
+def test_resolve_hermes_argv_uses_own_source_launcher(monkeypatch, tmp_path):
+    """The parent's injected import path need not exist in a worker child."""
+    import subprocess
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    root = tmp_path / "source-install"
+    launcher = root / ".hermes" / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\nprintf 'source-launcher-ok\\n'\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(kbd, "__file__", str(root / "hermes_cli" / "kanban_db_dispatch.py"))
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+
+    argv = kbd._resolve_hermes_argv()
+    assert argv == [str(launcher)]
+    result = subprocess.run(argv, cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    assert (result.returncode, result.stdout) == (0, "source-launcher-ok\n")
 
 
-def test_resolve_hermes_argv_module_actually_runs():
+def test_resolve_hermes_argv_module_actually_runs(monkeypatch, tmp_path):
     """The fallback module name must be importable + runnable.
 
     A unit test that pins the literal string is necessary but not
@@ -1608,6 +1749,7 @@ def test_resolve_hermes_argv_module_actually_runs():
     import shutil
     import unittest.mock as mock
 
+    monkeypatch.setattr(kbd, "__file__", str(tmp_path / "hermes_cli" / "kanban_db_dispatch.py"))
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):

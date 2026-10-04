@@ -424,8 +424,13 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
     try:
         tokens = _set_session_context(sid, cwd=_session_cwd(session))
         try:
-            new_agent = _rebuild_session_agent(sid, session, session_id=session["session_key"],
-                                               platform_override=_session_source(session))
+            # This is not /new: capability edits must keep the conversation's runtime pins.
+            new_agent = _rebuild_session_agent(
+                sid, session, session_id=session["session_key"],
+                model_override=session.get("model_override"),
+                reasoning_config_override=session.get("create_reasoning_override"),
+                service_tier_override=session.get("create_service_tier_override"),
+                platform_override=_session_source(session))
         finally:
             _clear_session_context(tokens)
         new_agent._session_title_hint = "Bot Chat"

@@ -9,7 +9,9 @@ existing skills (bundled, hub, user) are modified in place. Layout:
 
 import contextvars as _ctxvars
 import hashlib
+import io
 import json
+import os
 from contextlib import ExitStack, suppress
 import logging
 import re
@@ -109,6 +111,7 @@ MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
 MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
+_batch_entry_targets = _ctxvars.ContextVar("skill_batch_entry_targets", default=frozenset())
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')  # filesystem-safe, URL-friendly
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}  # for write_file/remove_file
 _FRONTMATTER_END_RE = re.compile(r'\n---\s*\n')
@@ -195,6 +198,163 @@ def _description_preview(content: str) -> str:
         if fm_end:
             return str(yaml.safe_load(content[3:fm_end.start() + 3]).get("description", ""))[:120]
     return ""
+
+
+def _entry_char_limit() -> int:
+    """Resolve the active profile at call time; never turn an invalid cap into a lax default."""
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config_read_errors import FailedConfigRead
+    try:
+        config = load_config_readonly()
+    except Exception as exc:
+        raise ValueError("Cannot read skills.max_entry_chars; repair the profile config.yaml.") from exc
+    if isinstance(config, FailedConfigRead):
+        raise ValueError("Cannot read skills.max_entry_chars from invalid config.yaml; repair it first.")
+    skills = config.get("skills")
+    if skills is None:  # historical empty skills section
+        skills = {}
+    if not isinstance(skills, dict):
+        raise ValueError("skills must be a mapping; skills.max_entry_chars must be an integer.")
+    limit = skills.get("max_entry_chars", MAX_SKILL_CONTENT_CHARS)
+    if type(limit) is not int or not 1 <= limit <= MAX_SKILL_CONTENT_CHARS:
+        raise ValueError(
+            f"skills.max_entry_chars must be an integer from 1 to {MAX_SKILL_CONTENT_CHARS:,}; "
+            "booleans, null, strings and fractional values are not accepted.")
+    return limit
+
+
+def _validate_entry_size(content: str, original: Optional[str] = None, *,
+                         limit: Optional[int] = None) -> Optional[str]:
+    try:
+        limit = _entry_char_limit() if limit is None else limit
+    except ValueError as exc:
+        return str(exc)
+    if err := _validate_content_size(content):
+        return err  # the existing hard safety ceiling is never raised
+    size = len(content)
+    if size <= limit or (original is not None and size < len(original)):
+        return None
+    return (
+        f"SKILL.md is {size:,} characters (skills.max_entry_chars: {limit:,}). "
+        "Split distinct procedures into separate narrow skills, or move task-specific detail "
+        "into references/ loaded only on demand. No truncation was applied. An existing oversized "
+        "entry may only strictly shrink; equal-size edits and growth require an explicit cap change.")
+
+
+def _entry_text_after_read(content: str) -> str:
+    """Match atomic UTF-8 text write -> UTF-8-sig/universal-newline read, in memory."""
+    data = content.replace("\n", os.linesep).encode("utf-8")
+    with io.TextIOWrapper(io.BytesIO(data), encoding="utf-8-sig") as stream:
+        return stream.read()
+
+
+def _preflight_entry_sizes(operations, names):
+    try:
+        return _project_entry_sizes(operations, names)
+    except (OSError, UnicodeError, RuntimeError) as exc:
+        return frozenset(), f"Cannot safely read/project SKILL.md before writes: {exc}"
+
+
+def _entry_target_key(skill_dir: Path, target: Path) -> Optional[Path]:
+    """One canonical entry key for projection and commit, including case aliases."""
+    entry = (skill_dir / "SKILL.md").resolve()
+    if target.resolve() == entry:
+        return entry
+    try:
+        return entry if target.samefile(entry) else None
+    except FileNotFoundError:
+        return None
+
+
+def _project_entry_sizes(operations, names):
+    """Project entry text only, using the native patch matcher. Never load supporting references.
+
+    Other failures still belong to the existing atomic runner (and keep its teaching payload).
+    Resolved paths unify categorized names and safe in-skill aliases to the same entry.
+    """
+    from tools.fuzzy_match import fuzzy_find_and_replace
+    before, after, created = {}, {}, {}
+    written = set()
+    for op, name in zip(operations, names):
+        existing = _find_skill(name)
+        root = (existing["path"] if existing else
+                created.get(name, _resolve_skill_dir(name, op.get("category"))))
+        if op["action"] == "create":
+            if existing:
+                return frozenset(), f"A skill named '{name}' already exists at {root}."
+            created[name] = root
+        entry = (root / "SKILL.md").resolve()
+        action = op["action"]
+        full = action in {"create", "edit"} or (action == "patch" and op.get("content"))
+        if not full and op.get("file_path"):
+            target, err = _resolve_supporting_file(root, op["file_path"])
+            if err or target is None:
+                continue  # the native runner will reject this op and roll back
+            if _entry_target_key(root, target) is None:
+                continue
+            if action == "remove_file" and target.is_symlink():
+                # unlink removes the link, not its referent. Only unlinking the
+                # entry's own directory entry makes SKILL.md disappear.
+                if not os.path.samestat(target.lstat(), (root / "SKILL.md").lstat()):
+                    continue
+        if action == "remove_file":
+            # Pure removal needs neither readable entry text nor a valid cap.
+            before.setdefault(entry, None)
+            after[entry] = None
+            continue
+        if entry not in before:
+            before[entry] = entry.read_text(encoding="utf-8-sig") if entry.exists() else None
+            after[entry] = before[entry]
+        if full or action == "write_file":
+            after[entry] = op["content"] if full else op["file_content"]
+        else:
+            if after[entry] is None:
+                return frozenset(), None
+            text, _, _, err = fuzzy_find_and_replace(
+                _entry_text_after_read(after[entry]) if entry in written else after[entry],
+                op["old_string"], op["new_string"], op.get("replace_all", False))
+            if err:
+                return frozenset(), None
+            after[entry] = text
+        written.add(entry)
+    if not any(content is not None for content in after.values()):
+        return frozenset(after), None
+    try:
+        limit = _entry_char_limit()
+    except ValueError as exc:
+        return frozenset(), str(exc)
+    for entry, content in after.items():
+        if content is not None and (err := _validate_entry_size(content, before[entry], limit=limit)):
+            return frozenset(), err
+    return frozenset(after), None
+
+
+def _skill_manage_sized_batch(operations, default_name: Optional[str] = None,
+                             task_id: Optional[str] = None, session_id: Optional[str] = None):
+    """Fence projection + native commit/rollback together, so transient growth is not the verdict."""
+    from tools.skill_manager_batch import _BATCH_MAX_OPS, _validate_batch_ops
+    kwargs = {key: value for key, value in
+              (("default_name", default_name), ("task_id", task_id), ("session_id", session_id))
+              if value is not None}
+    if (not isinstance(operations, list) or not operations or len(operations) > _BATCH_MAX_OPS
+            or any(isinstance(op, dict) and op.get("action") == "delete" for op in operations)):
+        return _skill_manage_batch(operations, **kwargs)
+    names, err = _validate_batch_ops(operations, default_name, tool_error)
+    if err is not None:
+        return err
+    assert names is not None
+    for op, name in zip(operations, names):
+        if err := _validate_name(name if op["action"] == "create" else Path(name).name):
+            return tool_error(err, success=False)
+    with _skill_mutation_locks(names):
+        targets, err = _preflight_entry_sizes(operations, names)
+        if err:
+            return tool_error(f"Batch rejected before writes: {err}", success=False)
+        token = _batch_entry_targets.set(targets)
+        try:
+            return _skill_manage_batch(operations, **kwargs)
+        finally:
+            _batch_entry_targets.reset(token)
 
 
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
@@ -352,6 +512,10 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
         original = target.read_text(encoding="utf-8-sig")
+    entry = _entry_target_key(skill_dir, target)
+    if entry is not None and entry not in _batch_entry_targets.get():
+        if err := _validate_entry_size(content, original):
+            return _err(err)
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(target.parent)
     atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
@@ -408,6 +572,9 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
     skill_dir = _resolve_skill_dir(name, category)
+    if (skill_dir / "SKILL.md").resolve() not in _batch_entry_targets.get():
+        if err := _validate_entry_size(content):
+            return _err(err)
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(skill_dir.parent)
     try:
@@ -721,7 +888,7 @@ def skill_manage(
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
     if operations is not None:
-        return _skill_manage_batch(
+        return _skill_manage_sized_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
     if (preflight := _background_review_preflight(action, name)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
@@ -730,8 +897,6 @@ def skill_manage(
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
                 old_string=old_string, new_string=new_string, replace_all=replace_all,
                 absorbed_into=absorbed_into)
-    if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
-        return gate_result
     if (shape_err := _op_shape_error(action, args)) is not None:
         return tool_error(shape_err, success=False)
     # Validate before the lock is keyed on the name, so a rejected name never touches .locks/
@@ -742,6 +907,16 @@ def skill_manage(
     # to a helper: guards, ledger capture, patch matching, validation, rollback,
     # and the atomic replacement all belong to the same ownership window.
     with _skill_mutation_lock(name):
+        # Flat calls must reject oversize entries before staging too. A native
+        # batch already validated its FINAL state; do not recheck its transients.
+        if action in {"create", "edit", "patch", "write_file"} and not _batch_entry_targets.get():
+            if action == "create" and (err := _validate_category(category)):
+                return tool_error(err, success=False)
+            _, err = _preflight_entry_sizes([{"action": action, **args}], [name])
+            if err:
+                return tool_error(f"Rejected before writes: {err}", success=False)
+        if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
+            return gate_result
         # Ledger pre-capture: telemetry, not a gate — failures must NEVER block the mutation. delete
         # destroys the whole package (consolidation may have re-homed support files first), so
         # complete it from the newest curator backup or a restore is hollow.

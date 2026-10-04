@@ -3,8 +3,21 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.conversation_compression import compress_context
 from agent.context_compressor import ContextCompressor
+
+
+@pytest.fixture(autouse=True)
+def _isolate_launcher_bootstrap(monkeypatch):
+    """Test native telemetry without late imports activating the real install.
+
+    Keep the home-I/O guard active; launcher recovery is outside this suite.
+    """
+    monkeypatch.setattr("hermes_cli.venv_sync.prepare_launch", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli._early_recovery.recover_if_needed", lambda *args, **kwargs: None)
+    monkeypatch.setattr("pm.environments.activate_dependencies", lambda *args, **kwargs: None)
 
 
 class _TodoStore:

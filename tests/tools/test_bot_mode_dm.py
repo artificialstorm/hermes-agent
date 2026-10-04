@@ -316,6 +316,58 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
 
 
 
+def test_local_delivery_runner_uses_target_cli_environment(tmp_path):
+    """A tool-host Python may lack dependencies imported by live-owner admission."""
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    cli = bin_dir / "hermes"
+    cli.touch()
+    target_python = bin_dir / ("python.exe" if sys.platform == "win32" else "python3")
+    target_python.touch()
+
+    command = bot_mode_dm._delivery_command(
+        [str(cli), "-p", "researcher", "chat"],
+        str(tmp_path / "message.txt"), stdin_file=False, profile_home=tmp_path,
+    )
+    assert shlex.split(command)[0] == str(target_python)
+    assert "--profile-home" in shlex.split(command)
+
+    target_python.unlink()
+    fallback = bot_mode_dm._delivery_command(
+        [str(cli), "-p", "researcher", "chat"],
+        str(tmp_path / "message.txt"), stdin_file=False, profile_home=tmp_path,
+    )
+    assert shlex.split(fallback)[0] == sys.executable
+
+
+@pytest.mark.platforms("posix")
+def test_local_delivery_runner_reaches_cli_from_target_environment(tmp_path):
+    """Exercise the real admission imports and CLI fallback in a temporary profile."""
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    target_python = bin_dir / "python3"
+    target_python.write_text(
+        "#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n', encoding="utf-8",
+    )
+    target_python.chmod(0o700)
+    cli = bin_dir / "hermes"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli.chmod(0o700)
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("test delivery", encoding="utf-8")
+
+    command = bot_mode_dm._delivery_command(
+        [str(cli), "-p", "researcher", "chat"],
+        str(dm_file), stdin_file=False, profile_home=tmp_path / "receiver",
+    )
+    result = subprocess.run(
+        shlex.split(command), cwd=Path(__file__).resolve().parents[2],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
+    assert not dm_file.exists()
+
+
 def test_cli_runner_ack_is_queued_with_the_runner_delivery_id(tmp_path, monkeypatch):
     """The CLI-runner ack speaks the same vocabulary as the live-owner and relay branches:
     ``queued`` + ``delivery_id`` (+ ``process_id``). The id is the one the runner itself pins

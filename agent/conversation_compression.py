@@ -2377,35 +2377,63 @@ def _replace_message_content(message: dict, content: Any) -> None:
     drop_stale_api_content(message)
 
 
-# Compaction re-injects the todo list verbatim but prunes skills to markers, so
-# couple them: tell the model to reload pruned skills BEFORE acting on tasks.
-# Lives after TODO_INJECTION_HEADER so it strips with the snapshot next time.
-_PRUNED_SKILL_RELOAD_NOTICE_HEADER = "[Skills pruned during compression — reload before acting on these tasks]"
+# Keep recovery guidance with the todo snapshot, without turning historical
+# skill markers into an unconditional reload queue. Strips with the snapshot.
+_PRUNED_SKILL_RELOAD_NOTICE_HEADER = "[Skills pruned during compression — reload only if needed for the current task]"
 
 
 def _pruned_skill_reload_notice(compressed: list) -> str:
-    """Reload notice for skills whose bodies were pruned, or ``""``.
-    Scans ``[SKILL_PRUNED: ...]`` markers in the post-compression transcript; first-seen order, deduplicated,
-    capped at ``_MAX_PRUNED_SKILL_MARKERS``."""
-    from agent.context_compressor import _MAX_PRUNED_SKILL_MARKERS, _extract_pruned_skill_names
+    """Bounded recovery notice, excluding full skill bodies retained in context.
+
+    Historical markers do not prove a current task dependency or override a
+    successful retained reload. Failed and reference-only reads cannot satisfy it.
+    """
+    from agent.context_compressor import (
+        _MAX_PRUNED_SKILL_MARKERS, _extract_pruned_skill_names, _json_dict, _tc_get,
+    )
+
     names: list = []
+    calls_by_id: dict = {}
+    retained: set = set()
     for message in compressed:
         if not isinstance(message, dict):
             continue
         for name in _extract_pruned_skill_names(_message_text(message)):
+            if name in {"...", "?"}:  # instruction template / unknown tool argument
+                continue
+            # Only a later usable body can supersede this loss of instructions.
+            retained.discard(name)
             if name not in names:
                 names.append(name)
-    del names[_MAX_PRUNED_SKILL_MARKERS:]
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                fn = _tc_get(call, "function", {})
+                if _tc_get(fn, "name") == "skill_view":
+                    args = _json_dict(_tc_get(fn, "arguments"))
+                    if not args.get("file_path"):
+                        calls_by_id[_tc_get(call, "id")] = args.get("name")
+        elif message.get("role") == "tool":
+            name = calls_by_id.get(message.get("tool_call_id"))
+            result = _json_dict(message.get("content"))
+            body = result.get("content")
+            if (
+                isinstance(name, str) and name
+                and result.get("success") is True
+                and isinstance(body, str) and body.strip()
+                and not body.lstrip().startswith(("[skill_view]", "[SKILL_PRUNED"))
+            ):
+                retained.add(name)
+    names = [name for name in names if name not in retained][:_MAX_PRUNED_SKILL_MARKERS]
     if not names:
         return ""
     calls = "; ".join(f"skill_view(name='{name}')" for name in names)
     return (
         f"{_PRUNED_SKILL_RELOAD_NOTICE_HEADER}\n"
-        "The task list above crossed the compression boundary verbatim, but "
-        "the skill instructions that governed it were pruned. Before "
-        f"executing any preserved task that depends on these skills, reload "
-        f"them first: {calls}. After reloading, re-check that each pending "
-        "task is still justified — findings recorded before the boundary may have invalidated it."
+        "These historical markers are not a task list or evidence that every listed skill is relevant. "
+        f"Reload only a skill needed for the current task whose full instructions are absent: {calls}. "
+        "After a successful reload, ignore older markers for that skill while its body remains in context. "
+        "Do not bulk-reload unrelated skills. Re-check that each pending task is still justified — "
+        "findings recorded before the boundary may have invalidated it."
     )
 
 

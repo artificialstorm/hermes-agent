@@ -1454,6 +1454,9 @@ DEFAULT_CONFIG = {
         # land here AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to
         # HERMES_HOME, scanned alongside the local dir.
         "create_dir": "",
+        # Total SKILL.md characters, including frontmatter. Strict reductions of legacy oversized
+        # entries are allowed, but the 100k hard ceiling and supporting-file limits still apply.
+        "max_entry_chars": 100_000,
         # In a git checkout, <root>/.hermes/skills/ and <root>/.agents/skills/ load as the
         # highest-precedence tier — ONLY if the root is in trusted_project_dirs. false = no scan, no
         # untrusted-skills notice.

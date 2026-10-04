@@ -2969,10 +2969,14 @@ def _get_channel_override(
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
-    """Hermes update/restart argv: the running interpreter's ``python -m hermes_cli.main``
-    (exactly this install), else ``hermes`` on PATH, else None. The module argv must win: a
-    PATH-first lookup lets an attacker-planted ``hermes`` shadow the running install when
-    /update or /restart re-execs it (#111569)."""
+    """Hermes update/restart argv: this source install's own launcher, then the
+    running interpreter's ``python -m hermes_cli.main`` for shim-less installs,
+    else ``hermes`` on PATH, else None. The module can be importable only via
+    the gateway's injected ``sys.path``, which a fresh child does not inherit.
+    Never prefer an arbitrary PATH shim over this install (#111569)."""
+    source_launcher = Path(__file__).resolve().parents[1] / ".hermes" / "bin" / "hermes"
+    if source_launcher.is_file() and os.access(source_launcher, os.X_OK):
+        return [str(source_launcher)]
     try:
         import importlib.util
         if importlib.util.find_spec("hermes_cli") is not None:

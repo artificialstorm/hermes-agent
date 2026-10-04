@@ -1135,6 +1135,7 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    attempt_blocked: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1207,6 +1208,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+                # Quota is neutral for failure accounting but still used a
+                # claim. Park inside this transaction before the next tick.
+                if _kb._block_exhausted_automatic_attempts(
+                    conn, row["id"], retry_status,
+                    trigger_outcome="rate_limited", run_id=run_id,
+                ):
+                    sweep.attempt_blocked.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1300,7 +1308,8 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     tasks claimed by *this host* only — other hosts' PIDs are meaningless.
     Clean exit while ``running`` is a protocol violation with a bounded
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
-    wall, released WITHOUT counting a failure and surfaced via the
+    wall, neutral for the failure counter but held when the separate total
+    automatic-attempt ceiling is reached. Quota exits are surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
     """
     sweep = _reclaim_dead_workers(conn, board=board)
@@ -1309,7 +1318,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
-    detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+    detect_crashed_workers._last_auto_blocked = auto_blocked + sweep.attempt_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
@@ -1370,8 +1379,8 @@ def _record_task_failure(
     ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
     #114720) — nothing about the card ran, so the run and event are recorded
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
-    the breaker never trips; the card stays retryable and
-    :func:`check_respawn_guard` spaces the retries.
+    the failure breaker never trips; the separate total-attempt cap can still
+    park the card. :func:`check_respawn_guard` spaces attempts below that cap.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1555,8 +1564,8 @@ def check_respawn_guard(
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
     #    An infrastructure spawn refusal (#114720) shares the cooldown: the host
-    #    condition is not the card's, so it retries forever, spaced, and never
-    #    reaches the breaker.
+    #    condition is not the card's, so it does not charge the failure breaker;
+    #    the separate total automatic-attempt ceiling still applies.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
@@ -1578,8 +1587,8 @@ def check_respawn_guard(
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        # stamped rate-limit text. The separate claim boundary still enforces
+        # the total automatic-attempt ceiling.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
@@ -2092,12 +2101,29 @@ def _dispatch_lane_task(
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
     if dry_run:
+        budget = _kb._automatic_attempt_budget(conn, task_id, lane)
+        if budget is not None and budget[0] >= budget[1]:
+            result.respawn_guarded.append((task_id, "automatic_attempt_ceiling"))
+            return False
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
+    before_changes = conn.total_changes
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
+        # The claim path can atomically park an exhausted phase and emit
+        # gave_up without opening another run. Distinguish that write from a
+        # lost claim so dispatch results agree with the durable board event.
+        if conn.total_changes > before_changes:
+            current = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            event = _kb._latest_event(conn, task_id, "gave_up")
+            if (current is not None and current["status"] == "blocked"
+                    and event is not None and
+                    _kb._json_dict(event["payload"]).get("reason") == "automatic_attempt_ceiling"):
+                result.auto_blocked.append(task_id)
         return False
     try:
         resolved_branch_name = None
@@ -2576,14 +2602,13 @@ def _hermes_path_argv(path: str) -> list[str]:
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
-    lets an attacker-planted ``hermes`` shadow the running install (#111569).
-    Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
-    sits below ``gateway`` in the dependency order.
+    same-directory file), then this source install's own published launcher,
+    then the running interpreter's ``sys.executable -m hermes_cli.main`` for
+    shim-less installs, then ``which("hermes")`` only when ``hermes_cli`` is not
+    importable. A source gateway injects its repository into the parent's
+    ``sys.path``; a worker's fresh interpreter does not inherit that injection.
+    Never prefer an arbitrary PATH shim over the running install (#111569).
+    Local because ``hermes_cli`` sits below ``gateway`` in dependency order.
     """
     import importlib.util
     import shutil
@@ -2596,6 +2621,10 @@ def _resolve_hermes_argv() -> list[str]:
         if resolved_env_bin:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
+
+    source_launcher = Path(__file__).resolve().parents[1] / ".hermes" / "bin" / "hermes"
+    if source_launcher.is_file() and os.access(source_launcher, os.X_OK):
+        return [str(source_launcher)]
 
     try:
         if importlib.util.find_spec("hermes_cli") is not None:
