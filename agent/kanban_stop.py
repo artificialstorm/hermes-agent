@@ -8,6 +8,7 @@ instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -49,14 +50,52 @@ def _tool_call_name(tc: Any) -> str:
 
 
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
+    """True only for a successful terminal result, never a requested/denied call.
+
+    Results normally omit the tool name, so correlate by call id. A named result
+    can survive transcript compaction without its assistant call. Unknown results
+    remain unconfirmed: the nudge asks for board readback before another mutation.
+    """
+    calls: dict[str, str] = {}
+    owned = owned_kanban_task()
     for msg in filter(lambda m: isinstance(m, dict), messages or ()):
         role = msg.get("role")
-        if role == "assistant" and any(
-            _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS for tc in msg.get("tool_calls") or []
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                cid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                if cid:
+                    calls[str(cid)] = _tool_call_name(tc)
+            continue
+        if role != "tool":
+            continue
+        name = calls.get(str(msg.get("tool_call_id") or ""), str(msg.get("name") or ""))
+        if name not in _TERMINAL_KANBAN_TOOLS:
+            continue
+        result = msg.get("content")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            continue
+        if result.get("error") or result.get("success") is False:
+            continue
+        if owned and result.get("task_id") not in (None, owned):
+            continue
+        status = result.get("status")
+        # Completion responses may omit status. Supplied malformed/unknown values
+        # are unconfirmed, not exceptions that disable the bounded nudge.
+        if "status" in result and (
+            not isinstance(status, str)
+            or status not in {"todo", "ready", "review", "scheduled", "blocked", "done"}
         ):
-            return True
-        if role == "tool" and str(msg.get("name") or "") in _TERMINAL_KANBAN_TOOLS:
+            continue
+        if status == "todo" and not (
+            name == "kanban_block" and result.get("block_kind") == "dependency"
+        ):
+            continue
+        if not msg.get("is_error"):
             return True
     return False
 
@@ -78,14 +117,16 @@ def build_kanban_stop_nudge(
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
-    # The transcript is the status source: this text is only reached when the session made no
-    # handoff call, so it never tells a worker to close a card it already sent to review.
+    # Unknown responses require readback, not a blind duplicate terminal mutation.
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
-        f"Task `{tid}` has not been handed off: this session made no terminal board "
-        "call (`kanban_complete` / `kanban_request_review` / `kanban_block`). Ending now "
-        "causes a protocol violation (clean exit with the card still `running`).\n\n"
+        f"Task `{tid}` has no confirmed successful terminal board result in this session. "
+        "A requested, denied, failed or ambiguous call is not proof of handoff. "
+        "First call `kanban_show` to read back the card. If it has already left your "
+        "owned running state (including todo, review, ready, scheduled, blocked or done), "
+        "do not repeat the transition or close a card handed to a reviewer. "
+        "Only if it is still running and owned by this run, continue below.\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work is done "

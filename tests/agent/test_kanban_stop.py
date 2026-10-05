@@ -87,7 +87,7 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
                 }
             ],
         },
-        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
+        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": '{"ok": true, "task_id": "t_abc"}'},
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
@@ -131,7 +131,7 @@ def test_no_nudge_after_handoff_tool(clear_kanban_env, tool_name, who):
                 }
             ],
         },
-        {"role": "tool", "name": tool_name, "tool_call_id": "1", "content": "ok"},
+        {"role": "tool", "name": tool_name, "tool_call_id": "1", "content": '{"ok": true, "task_id": "t_handoff"}'},
     ]
     assert session_called_kanban_terminal(messages) is True, who
     assert build_kanban_stop_nudge(messages=messages) is None
